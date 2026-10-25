@@ -47,6 +47,7 @@
     <ClInclude Include="Control\CommandDispatcher.h" />
     <ClInclude Include="Control\CommandHandlers.h" />
     <ClInclude Include="Control\ControlTransport.h" />
+    <ClInclude Include="Control\ScopedMonitor.h" />
     <ClInclude Include="Device\DisplayModeHelpers.h" />
     <ClInclude Include="Device\IndirectDeviceContext.h" />
     <ClInclude Include="Device\IndirectDeviceContextWrapper.h" />

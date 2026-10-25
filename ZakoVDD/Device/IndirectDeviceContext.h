@@ -1,5 +1,6 @@
 #pragma once
 
+#include "..\Control\ScopedMonitor.h"
 #include "..\Driver.h"
 #include "..\Rendering\SwapChainProcessor.h"
 
@@ -30,6 +31,10 @@ namespace Microsoft
 
 			void CreateMonitor(unsigned int index, const GUID *pClientGuid = nullptr, float maxNits = 1000.0f, float minNits = 0.0001f, float maxFALL = 0.0f, float widthCm = 0.0f, float heightCm = 0.0f);
 			bool DestroyMonitor(unsigned int index);
+			ZakoScopedMonitor::PlatformState ScopedMonitorSnapshot() const;
+			NTSTATUS CreateScopedMonitor(const GUID &clientGuid);
+			NTSTATUS DestroyScopedMonitor(const GUID &clientGuid);
+			void RollbackScopedMonitorCreate(const GUID &clientGuid);
 
 			void AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
 			void UnassignSwapChain(IDDCX_MONITOR Monitor);
@@ -62,6 +67,15 @@ namespace Microsoft
 			};
 
 			bool RecreateMonitor(unsigned int index);
+			NTSTATUS CreateMonitorWithStatus(
+				unsigned int index,
+				const GUID *pClientGuid,
+				float maxNits,
+				float minNits,
+				float maxFALL,
+				float widthCm,
+				float heightCm);
+			NTSTATUS DestroyMonitorWithStatus(unsigned int index);
 
 			WDFDEVICE m_WdfDevice;
 			IDDCX_ADAPTER m_Adapter;

@@ -1,5 +1,6 @@
 #include "..\Driver.h"
 #include "..\Core\DriverState.h"
+#include "..\Control\ScopedMonitor.h"
 #include "..\Edid\Edid.h"
 #include "..\Logging\Logger.h"
 #include "..\Util\StringConversion.h"
@@ -9,6 +10,7 @@
 #include "MonitorState.h"
 
 #include <climits>
+#include <cstring>
 #include <exception>
 #include <sstream>
 #include <tuple>
@@ -21,12 +23,17 @@ void CreateTargetMode2(IDDCX_TARGET_MODE2 &Mode, UINT Width, UINT Height, UINT V
 
 void IndirectDeviceContext::CreateMonitor(unsigned int index, const GUID *pClientGuid, float maxNits, float minNits, float maxFALL, float widthCm, float heightCm)
 {
+	(void)CreateMonitorWithStatus(index, pClientGuid, maxNits, minNits, maxFALL, widthCm, heightCm);
+}
+
+NTSTATUS IndirectDeviceContext::CreateMonitorWithStatus(unsigned int index, const GUID *pClientGuid, float maxNits, float minNits, float maxFALL, float widthCm, float heightCm)
+{
 	std::lock_guard<std::recursive_mutex> lock(m_monitorsMutex);
 	auto existingMonitor = m_Monitors.find(index);
 	if (existingMonitor != m_Monitors.end() && existingMonitor->second != nullptr)
 	{
 		VDD_LOG_INFO_STREAM("Monitor " << (index + 1) << " already exists; treating duplicate create as success");
-		return;
+		return STATUS_SUCCESS;
 	}
 
 	wstring logMessage = L"Creating Monitor: " + to_wstring(index + 1);
@@ -172,7 +179,7 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index, const GUID *pClien
 		if (newMonitor == nullptr)
 		{
 			VDD_LOG_ERROR("Invalid monitor handle");
-			return;
+			return STATUS_INVALID_DEVICE_REQUEST;
 		}
 
 		auto *pContext = WdfObjectGet_IndirectDeviceContextWrapper(MonitorCreateOut.MonitorObject);
@@ -222,9 +229,15 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index, const GUID *pClien
 	{
 		VDD_LOG_ERROR_STREAM("Failed to create monitor. Status: " << Status);
 	}
+	return Status;
 }
 
 bool IndirectDeviceContext::DestroyMonitor(unsigned int index)
+{
+	return NT_SUCCESS(DestroyMonitorWithStatus(index));
+}
+
+NTSTATUS IndirectDeviceContext::DestroyMonitorWithStatus(unsigned int index)
 {
 	std::lock_guard<std::recursive_mutex> lock(m_monitorsMutex);
 
@@ -233,7 +246,7 @@ bool IndirectDeviceContext::DestroyMonitor(unsigned int index)
 	{
 		VDD_LOG_WARNING_STREAM("Monitor handle for index " << index << " is already null or not found");
 		m_MonitorCreationParams.erase(index);
-		return true;
+		return STATUS_SUCCESS;
 	}
 
 	IDDCX_MONITOR hMonitor = monIt->second;
@@ -303,19 +316,19 @@ bool IndirectDeviceContext::DestroyMonitor(unsigned int index)
 			// Keep the monitor registered so a later request can retry departure.
 			// An arrived IDDCX_MONITOR must not be deleted directly.
 			VDD_LOG_ERROR("All monitor departure attempts failed; retaining monitor for a later retry");
-			return false;
+			return Status;
 		}
 	}
 	catch (const exception &e)
 	{
 		VDD_LOG_ERROR_STREAM("Exception during monitor destruction (Index: " << index
 		                     << "); retaining monitor for a later retry: " << e.what());
-		return false;
+		return STATUS_UNSUCCESSFUL;
 	}
 	catch (...)
 	{
 		VDD_LOG_ERROR("Unknown exception during monitor destruction; retaining monitor for a later retry");
-		return false;
+		return STATUS_UNSUCCESSFUL;
 	}
 
 	// IddCxMonitorDeparture has destroyed the IDDCX_MONITOR. It is now safe to
@@ -345,7 +358,143 @@ bool IndirectDeviceContext::DestroyMonitor(unsigned int index)
 	m_Monitors.erase(monIt);
 	m_MonitorCreationParams.erase(index);
 	VDD_LOG_INFO_STREAM("Monitor departed successfully (Index: " << index << ")");
-	return true;
+	return STATUS_SUCCESS;
+}
+
+
+ZakoScopedMonitor::PlatformState IndirectDeviceContext::ScopedMonitorSnapshot() const
+{
+	std::lock_guard<std::recursive_mutex> lock(m_monitorsMutex);
+	ZakoScopedMonitor::PlatformState state = {};
+	const auto monitor = m_Monitors.find(ZAKO_SCOPED_MONITOR_INDEX);
+	const auto guid = m_MonitorGuids.find(ZAKO_SCOPED_MONITOR_INDEX);
+	state.hasMonitor0 = monitor != m_Monitors.end() && monitor->second != nullptr;
+	state.hasMonitorGuids0 = guid != m_MonitorGuids.end();
+	if (state.hasMonitorGuids0)
+	{
+		state.monitorGuid0 = guid->second;
+	}
+	state.hasAnyMonitor = !m_Monitors.empty() || !m_MonitorGuids.empty();
+	for (const auto &pair : m_Monitors)
+	{
+		state.hasForeignMonitor = state.hasForeignMonitor ||
+			pair.first != ZAKO_SCOPED_MONITOR_INDEX;
+	}
+	for (const auto &pair : m_MonitorGuids)
+	{
+		state.hasForeignMonitor = state.hasForeignMonitor ||
+			pair.first != ZAKO_SCOPED_MONITOR_INDEX;
+	}
+	return state;
+}
+
+NTSTATUS IndirectDeviceContext::CreateScopedMonitor(const GUID &clientGuid)
+{
+	std::lock_guard<std::recursive_mutex> lock(m_monitorsMutex);
+
+	bool hasForeignMonitor = false;
+	for (const auto &pair : m_Monitors)
+	{
+		hasForeignMonitor = hasForeignMonitor ||
+			pair.first != ZAKO_SCOPED_MONITOR_INDEX;
+	}
+	for (const auto &pair : m_MonitorGuids)
+	{
+		hasForeignMonitor = hasForeignMonitor ||
+			pair.first != ZAKO_SCOPED_MONITOR_INDEX;
+	}
+	if (hasForeignMonitor)
+	{
+		return STATUS_DEVICE_BUSY;
+	}
+
+	const auto existingMonitor = m_Monitors.find(ZAKO_SCOPED_MONITOR_INDEX);
+	const auto existingGuid = m_MonitorGuids.find(ZAKO_SCOPED_MONITOR_INDEX);
+	if (existingMonitor != m_Monitors.end() && existingMonitor->second != nullptr)
+	{
+		if (existingGuid != m_MonitorGuids.end() &&
+		    ZakoScopedMonitor::SameGuid(existingGuid->second, clientGuid))
+		{
+			return STATUS_SUCCESS;
+		}
+		return STATUS_DEVICE_BUSY;
+	}
+	if (!m_Monitors.empty() || !m_MonitorGuids.empty())
+	{
+		return STATUS_DEVICE_BUSY;
+	}
+
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	try
+	{
+		status = CreateMonitorWithStatus(
+			ZAKO_SCOPED_MONITOR_INDEX,
+			&clientGuid,
+			1000.0f,
+			0.0001f,
+			0.0f,
+			0.0f,
+			0.0f);
+	}
+	catch (...)
+	{
+		VDD_LOG_ERROR("Exception during scoped monitor creation");
+		status = STATUS_UNSUCCESSFUL;
+	}
+
+	const auto createdMonitor = m_Monitors.find(ZAKO_SCOPED_MONITOR_INDEX);
+	const auto createdGuid = m_MonitorGuids.find(ZAKO_SCOPED_MONITOR_INDEX);
+	const bool created =
+		createdMonitor != m_Monitors.end() && createdMonitor->second != nullptr &&
+		createdGuid != m_MonitorGuids.end() &&
+		ZakoScopedMonitor::SameGuid(createdGuid->second, clientGuid);
+	if (created)
+	{
+		return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
+	}
+
+	RollbackScopedMonitorCreate(clientGuid);
+	return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
+}
+
+void IndirectDeviceContext::RollbackScopedMonitorCreate(const GUID &clientGuid)
+{
+	std::lock_guard<std::recursive_mutex> lock(m_monitorsMutex);
+
+	const auto guid = m_MonitorGuids.find(ZAKO_SCOPED_MONITOR_INDEX);
+	if (guid != m_MonitorGuids.end() &&
+	    !ZakoScopedMonitor::SameGuid(guid->second, clientGuid))
+	{
+		return;
+	}
+
+	NTSTATUS status = STATUS_SUCCESS;
+	const auto monitor = m_Monitors.find(ZAKO_SCOPED_MONITOR_INDEX);
+	if (monitor != m_Monitors.end() && monitor->second != nullptr)
+	{
+		status = DestroyMonitorWithStatus(ZAKO_SCOPED_MONITOR_INDEX);
+	}
+	if (NT_SUCCESS(status))
+	{
+		m_MonitorGuids.erase(ZAKO_SCOPED_MONITOR_INDEX);
+		m_MonitorCreationParams.erase(ZAKO_SCOPED_MONITOR_INDEX);
+	}
+}
+
+NTSTATUS IndirectDeviceContext::DestroyScopedMonitor(const GUID &clientGuid)
+{
+	std::lock_guard<std::recursive_mutex> lock(m_monitorsMutex);
+
+	const auto monitor = m_Monitors.find(ZAKO_SCOPED_MONITOR_INDEX);
+	const auto guid = m_MonitorGuids.find(ZAKO_SCOPED_MONITOR_INDEX);
+	if (monitor == m_Monitors.end() || monitor->second == nullptr ||
+	    guid == m_MonitorGuids.end() ||
+	    !ZakoScopedMonitor::SameGuid(guid->second, clientGuid))
+	{
+		return STATUS_SUCCESS;
+	}
+
+	return DestroyMonitorWithStatus(ZAKO_SCOPED_MONITOR_INDEX);
 }
 
 void IndirectDeviceContext::DestroyAllMonitors()

@@ -1,10 +1,13 @@
 #include "ControlTransport.h"
 
 #include "CommandDispatcher.h"
+#include "ScopedMonitor.h"
+#include "..\Core\DriverState.h"
 #include "..\Device\IndirectDeviceContextWrapper.h"
 #include "..\Logging\Logger.h"
 #include "..\Util\StringConversion.h"
 
+#include <exception>
 #include <sstream>
 #include <string>
 #include <vdd_control_ioctl.h>
@@ -143,6 +146,123 @@ static NTSTATUS HandleOpenFrameChannel(WDFDEVICE Device,
 	return STATUS_SUCCESS;
 }
 
+
+static NTSTATUS HandleScopedMonitor(
+	bool mutate,
+	const ZAKO_SCOPED_MONITOR_REQUEST &request,
+	ZAKO_SCOPED_MONITOR_RESPONSE &response)
+{
+	if (g_GlobalDevice == nullptr)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+
+	lock_guard<mutex> lock(g_Mutex);
+	auto *pContext = WdfObjectGet_IndirectDeviceContextWrapper(g_GlobalDevice);
+	if (!pContext || !pContext->pContext)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+
+	class DriverPlatform
+	{
+	public:
+		explicit DriverPlatform(Microsoft::IndirectDisp::IndirectDeviceContext &context) : m_Context(context) {}
+
+		ZakoScopedMonitor::PlatformState Snapshot()
+		{
+			return m_Context.ScopedMonitorSnapshot();
+		}
+
+		NTSTATUS Create(const GUID &clientGuid)
+		{
+			return m_Context.CreateScopedMonitor(clientGuid);
+		}
+
+		void RollbackCreate(const GUID &clientGuid)
+		{
+			m_Context.RollbackScopedMonitorCreate(clientGuid);
+		}
+
+		NTSTATUS Destroy(const GUID &clientGuid)
+		{
+			return m_Context.DestroyScopedMonitor(clientGuid);
+		}
+
+	private:
+		Microsoft::IndirectDisp::IndirectDeviceContext &m_Context;
+	};
+
+	DriverPlatform platform(*pContext->pContext);
+	return ZakoScopedMonitor::ProcessRequest(
+		platform,
+		mutate,
+		sizeof(request),
+		sizeof(response),
+		request,
+		response);
+}
+
+static void CompleteScopedMonitorRequest(
+	WDFREQUEST Request,
+	bool mutate,
+	size_t OutputBufferLength,
+	size_t InputBufferLength)
+{
+	if (InputBufferLength != sizeof(ZAKO_SCOPED_MONITOR_REQUEST) ||
+	    OutputBufferLength != sizeof(ZAKO_SCOPED_MONITOR_RESPONSE))
+	{
+		WdfRequestComplete(Request, STATUS_INVALID_BUFFER_SIZE);
+		return;
+	}
+
+	PVOID input = nullptr;
+	size_t inputLength = 0;
+	NTSTATUS status = WdfRequestRetrieveInputBuffer(
+		Request, sizeof(ZAKO_SCOPED_MONITOR_REQUEST), &input, &inputLength);
+	if (!NT_SUCCESS(status))
+	{
+		WdfRequestComplete(Request, status);
+		return;
+	}
+
+	PVOID output = nullptr;
+	size_t outputLength = 0;
+	status = WdfRequestRetrieveOutputBuffer(
+		Request, sizeof(ZAKO_SCOPED_MONITOR_RESPONSE), &output, &outputLength);
+	if (!NT_SUCCESS(status))
+	{
+		WdfRequestComplete(Request, status);
+		return;
+	}
+	if (outputLength < sizeof(ZAKO_SCOPED_MONITOR_RESPONSE))
+	{
+		WdfRequestComplete(Request, STATUS_INVALID_BUFFER_SIZE);
+		return;
+	}
+
+	const auto request = *static_cast<const ZAKO_SCOPED_MONITOR_REQUEST *>(input);
+	ZAKO_SCOPED_MONITOR_RESPONSE response = ZakoScopedMonitor::EmptyResponse();
+	try
+	{
+		status = HandleScopedMonitor(mutate, request, response);
+	}
+	catch (...)
+	{
+		status = STATUS_UNSUCCESSFUL;
+	}
+
+	if (NT_SUCCESS(status))
+	{
+		RtlCopyMemory(output, &response, sizeof(response));
+		WdfRequestCompleteWithInformation(Request, status, sizeof(response));
+	}
+	else
+	{
+		WdfRequestComplete(Request, status);
+	}
+}
+
 // IddCx redirects every IRP_MJ_DEVICE_CONTROL into its own internal queue
 // before any default WDF queue ever sees it. The only way to receive a
 // custom IOCTL in an IddCx driver is through this callback registered via
@@ -188,6 +308,18 @@ VOID VirtualDisplayDriverIoDeviceControl(
 		{
 			WdfRequestComplete(Request, status);
 		}
+		return;
+	}
+
+	case ZAKO_SCOPED_MONITOR_IOCTL_QUERY:
+	{
+		CompleteScopedMonitorRequest(Request, false, OutputBufferLength, InputBufferLength);
+		return;
+	}
+
+	case ZAKO_SCOPED_MONITOR_IOCTL_MUTATE:
+	{
+		CompleteScopedMonitorRequest(Request, true, OutputBufferLength, InputBufferLength);
 		return;
 	}
 
